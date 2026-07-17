@@ -1,0 +1,17 @@
+[package]
+name = "neodos-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "MCP server for NeoDOS — kernel introspection, VFS, module analysis"
+
+[[bin]]
+name = "neodos-mcp"
+path = "src/main.rs"
+
+[dependencies]
+neodos-toolkit = { path = "../neodos-toolkit" }
+serde.workspace = true
+serde_json.workspace = true
+log.workspace = true
+env_logger = "0.11"

@@ -1,0 +1,24 @@
+[workspace]
+resolver = "2"
+members = [
+    "neodos-toolkit",
+    "neodos-lsp",
+    "neodos-mcp",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["NeoDOS-Project"]
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+log = "0.4"
+parking_lot = "0.12"
+dashmap = "6"
+rayon = "1"
+walkdir = "2"
+lsp-types = "0.97"
+url = "2"

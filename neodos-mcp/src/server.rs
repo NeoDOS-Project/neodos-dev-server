@@ -129,7 +129,7 @@ impl McpServer {
             "prompts": {},
         });
         Ok(serde_json::json!({
-            "protocolVersion": "1.0",
+            "protocolVersion": "2025-11-25",
             "capabilities": server_caps,
             "serverInfo": {
                 "name": self.name,

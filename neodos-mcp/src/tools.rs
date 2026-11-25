@@ -1,11 +1,163 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use neodos_toolkit::database::Database;
 use neodos_toolkit::analysis::{kernel, abi, consistency};
+use neodos_toolkit::analysis::consistency::{ConsistencyIssue, Severity};
 
 use crate::server::ToolSpec;
+
+/// Resolve the actual NeoDOS checkout when the MCP root is its parent directory
+/// (e.g. `~/rust-os` instead of `~/rust-os/neodos`).
+fn neodos_root(root: &Path) -> PathBuf {
+    if root.join("neodos-kernel").is_dir() {
+        root.to_path_buf()
+    } else if root.join("neodos").join("neodos-kernel").is_dir() {
+        root.join("neodos")
+    } else {
+        root.to_path_buf()
+    }
+}
+
+/// Locate a build artifact in the checkout, the parent workspace, or the
+/// canonical cargo target directories.
+fn resolve_artifact(root: &Path, name: &str) -> Option<PathBuf> {
+    let mut candidates = vec![root.join(name)];
+    if let Some(parent) = root.parent() {
+        candidates.push(parent.join(name));
+        candidates.push(parent.join("neodos").join(name));
+    }
+    candidates.push(root.join("neodos-kernel/target/x86_64-unknown-none/debug").join(name));
+    candidates.push(root.join("neodos-bootloader/target/x86_64-unknown-uefi/debug").join(name));
+    candidates.push(root.join("neodos-bootloader/target/x86_64-unknown-uefi/release").join(name));
+    candidates.into_iter().find(|path| path.exists())
+}
+
+/// Collect files with the given extension, skipping `target` and hidden dirs.
+fn collect_artifacts(dir: &Path, extension: &str, depth: usize, out: &mut Vec<PathBuf>) {
+    if depth == 0 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            let skip = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name == "target" || name.starts_with('.'))
+                .unwrap_or(true);
+            if !skip {
+                collect_artifacts(&path, extension, depth - 1, out);
+            }
+        } else if path.extension().and_then(|ext| ext.to_str()) == Some(extension) {
+            out.push(path);
+        }
+    }
+}
+
+fn push_issue(
+    issues: &mut Vec<ConsistencyIssue>,
+    severity: Severity,
+    category: &str,
+    message: String,
+) {
+    issues.push(ConsistencyIssue {
+        severity,
+        category: category.to_string(),
+        message,
+    });
+}
+
+fn format_issue(issue: &ConsistencyIssue) -> String {
+    let severity = match issue.severity {
+        Severity::Error => "ERROR",
+        Severity::Warning => "WARN",
+        Severity::Info => "INFO",
+    };
+    format!("[{severity}] {}: {}", issue.category, issue.message)
+}
+
+fn check_artifacts(root: &Path, issues: &mut Vec<ConsistencyIssue>) {
+    let required = [
+        ("kernel.elf", Severity::Error),
+        ("bootloader.efi", Severity::Error),
+        ("disk_image.img", Severity::Warning),
+    ];
+    for (name, severity) in required {
+        match resolve_artifact(root, name) {
+            Some(path) => {
+                let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                push_issue(
+                    issues,
+                    Severity::Info,
+                    "artifacts",
+                    format!("{name} ({} bytes) at {}", size, path.display()),
+                );
+            }
+            None => push_issue(
+                issues,
+                severity,
+                "artifacts",
+                format!("{name} not found (searched the checkout, parent workspace and target dirs)"),
+            ),
+        }
+    }
+
+    for (extension, label) in [("nxl", "NXL"), ("nem", "NEM")] {
+        let mut files = Vec::new();
+        collect_artifacts(root, extension, 4, &mut files);
+        if files.is_empty() {
+            push_issue(
+                issues,
+                Severity::Warning,
+                "artifacts",
+                format!("no .{extension} {label} artifacts found"),
+            );
+        } else {
+            push_issue(
+                issues,
+                Severity::Info,
+                "artifacts",
+                format!("{} .{extension} {label} artifact(s)", files.len()),
+            );
+        }
+    }
+}
+
+fn check_code(root: &Path, issues: &mut Vec<ConsistencyIssue>) {
+    for rel in [
+        "neodos-kernel/src/main.rs",
+        "neodos-kernel/src/syscall/mod.rs",
+        "neodos-kernel/src/object/types.rs",
+        "neodos-kernel/src/fs/vfs/mod.rs",
+        "libneodos/src/export.rs",
+    ] {
+        if root.join(rel).exists() {
+            push_issue(issues, Severity::Info, "code", format!("{rel} present"));
+        } else {
+            push_issue(issues, Severity::Error, "code", format!("{rel} missing"));
+        }
+    }
+}
+
+fn check_docs(root: &Path, issues: &mut Vec<ConsistencyIssue>) {
+    for rel in [
+        "docs/README.md",
+        "docs/kernel/syscalls.md",
+        "docs/kernel/objects.md",
+        "docs/architecture/source-of-truth.md",
+    ] {
+        if root.join(rel).exists() {
+            push_issue(issues, Severity::Info, "docs", format!("{rel} present"));
+        } else {
+            push_issue(issues, Severity::Warning, "docs", format!("{rel} missing"));
+        }
+    }
+}
 
 pub struct McpTools {
     root: PathBuf,
@@ -120,32 +272,10 @@ impl McpTools {
             {
                 let root = self.root.clone();
                 move |_| {
+                    let neodos = neodos_root(&root);
                     let mut issues = Vec::new();
-                    let kernel_elf = root.join("kernel.elf");
-                    if kernel_elf.exists() {
-                        if let Ok(meta) = std::fs::metadata(&kernel_elf) {
-                            issues.push(format!("✓ kernel.elf ({} bytes)", meta.len()));
-                        }
-                    } else {
-                        issues.push("✗ kernel.elf NOT FOUND".to_string());
-                    }
-                    let boot_efi = root.join("bootloader.efi");
-                    if boot_efi.exists() {
-                        if let Ok(meta) = std::fs::metadata(&boot_efi) {
-                            issues.push(format!("✓ bootloader.efi ({} bytes)", meta.len()));
-                        }
-                    } else {
-                        issues.push("✗ bootloader.efi NOT FOUND".to_string());
-                    }
-                    let disk_img = root.join("disk_image.img");
-                    if disk_img.exists() {
-                        if let Ok(meta) = std::fs::metadata(&disk_img) {
-                            issues.push(format!("✓ disk_image.img ({} MB)", meta.len() / 1024 / 1024));
-                        }
-                    } else {
-                        issues.push("⚠ disk_image.img not found".to_string());
-                    }
-                    issues.join("\n")
+                    check_artifacts(&neodos, &mut issues);
+                    issues.iter().map(format_issue).collect::<Vec<_>>().join("\n")
                 }
             },
         )
@@ -169,39 +299,28 @@ impl McpTools {
                 let root = self.root.clone();
                 move |params| {
                     let category = params.get("category").and_then(|v| v.as_str()).unwrap_or("all");
+                    let neodos = neodos_root(&root);
                     let mut out = String::new();
 
                     if category == "all" || category == "nem" {
-                        out.push_str("NEM Drivers:\n");
-                        let drivers_dir = root.join("drivers");
-                        if drivers_dir.is_dir() {
-                            if let Ok(entries) = std::fs::read_dir(&drivers_dir) {
-                                for entry in entries.flatten() {
-                                    if entry.path().is_dir() {
-                                        if let Some(name) = entry.file_name().to_str() {
-                                            out.push_str(&format!("  {name}\n"));
-                                        }
-                                    }
-                                }
-                            }
+                        let mut files = Vec::new();
+                        collect_artifacts(&neodos, "nem", 4, &mut files);
+                        files.sort();
+                        out.push_str(&format!("NEM Drivers ({}):\n", files.len()));
+                        for file in &files {
+                            let rel = file.strip_prefix(&neodos).unwrap_or(file);
+                            out.push_str(&format!("  {}\n", rel.display()));
                         }
                     }
 
                     if category == "all" || category == "dll" {
-                        out.push_str("\nNXL Libraries:\n");
-                        if let Ok(entries) = std::fs::read_dir(&root) {
-                            for entry in entries.flatten() {
-                                let p = entry.path();
-                                if p.is_dir() && p.file_name()
-                                    .and_then(|n| n.to_str())
-                                    .map(|n| n.starts_with("lib") && n.ends_with("-nxl"))
-                                    .unwrap_or(false)
-                                {
-                                    if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
-                                        out.push_str(&format!("  {name}\n"));
-                                    }
-                                }
-                            }
+                        let mut files = Vec::new();
+                        collect_artifacts(&neodos, "nxl", 3, &mut files);
+                        files.sort();
+                        out.push_str(&format!("\nNXL Libraries ({}):\n", files.len()));
+                        for file in &files {
+                            let rel = file.strip_prefix(&neodos).unwrap_or(file);
+                            out.push_str(&format!("  {}\n", rel.display()));
                         }
                     }
 
@@ -244,6 +363,7 @@ impl McpTools {
     }
 
     pub fn check_consistency(&self) -> ToolSpec {
+        let root = self.root.clone();
         Self::make_tool(
             "check_consistency",
             "Validate architectural consistency: code, docs, artifacts, invariants",
@@ -257,20 +377,37 @@ impl McpTools {
                     }
                 }
             }),
-            move |_| {
-                let mut out = String::from("=== Consistency Check ===\n");
-                let issues = consistency::check_invariants();
-                for issue in &issues {
-                    let sev = match issue.severity {
-                        consistency::Severity::Error => "ERROR",
-                        consistency::Severity::Warning => "WARN",
-                        consistency::Severity::Info => "INFO",
-                    };
-                    out.push_str(&format!("[{sev}] {}: {}\n", issue.category, issue.message));
+            move |params| {
+                let target = params
+                    .get("targets")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("all");
+                let neodos = neodos_root(&root);
+                let mut issues = Vec::new();
+
+                if target == "all" || target == "invariants" {
+                    issues.extend(consistency::check_invariants());
                 }
-                out.push_str(&format!("\nInvariants ({}):\n", consistency::INVARIANTS.len()));
-                for (id, desc) in consistency::INVARIANTS {
-                    out.push_str(&format!("  {id}: {desc}\n"));
+                if target == "all" || target == "artifacts" {
+                    check_artifacts(&neodos, &mut issues);
+                }
+                if target == "all" || target == "code" {
+                    check_code(&neodos, &mut issues);
+                }
+                if target == "all" || target == "docs" {
+                    check_docs(&neodos, &mut issues);
+                }
+
+                let mut out = format!("=== Consistency Check ({target}) ===\n");
+                for issue in &issues {
+                    out.push_str(&format_issue(issue));
+                    out.push('\n');
+                }
+                if target == "all" || target == "invariants" {
+                    out.push_str(&format!("\nInvariants ({}):\n", consistency::INVARIANTS.len()));
+                    for (id, desc) in consistency::INVARIANTS {
+                        out.push_str(&format!("  {id}: {desc}\n"));
+                    }
                 }
                 out
             },
@@ -396,5 +533,98 @@ impl McpTools {
             self.scheduler_info(),
             self.ipc_info(),
         ]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn fixture(name: &str) -> PathBuf {
+        let base = std::env::temp_dir().join(format!(
+            "neodos-mcp-test-{}-{name}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let neodos = base.join("neodos");
+        std::fs::create_dir_all(&neodos).unwrap();
+        for rel in [
+            "neodos-kernel/src/main.rs",
+            "neodos-kernel/src/syscall/mod.rs",
+            "neodos-kernel/src/object/types.rs",
+            "neodos-kernel/src/fs/vfs/mod.rs",
+            "libneodos/src/export.rs",
+            "docs/README.md",
+            "docs/kernel/syscalls.md",
+            "docs/kernel/objects.md",
+            "docs/architecture/source-of-truth.md",
+        ] {
+            let path = neodos.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "fixture").unwrap();
+        }
+        for rel in ["kernel.elf", "bootloader.efi", "disk_image.img", "libfoo.nxl"] {
+            std::fs::write(neodos.join(rel), "artifact").unwrap();
+        }
+        std::fs::create_dir_all(neodos.join("drivers/pci")).unwrap();
+        std::fs::write(neodos.join("drivers/pci/pci.nem"), "artifact").unwrap();
+        base
+    }
+
+    fn call(tool: ToolSpec, params: &[(&str, &str)]) -> String {
+        let mut map = HashMap::new();
+        for (key, value) in params {
+            map.insert((*key).to_string(), serde_json::Value::String((*value).to_string()));
+        }
+        (tool.handler)(&map)
+    }
+
+    #[test]
+    fn resolves_checkout_under_parent_root() {
+        let base = fixture("root");
+        let root = neodos_root(&base);
+        assert_eq!(root, base.join("neodos"));
+        assert!(resolve_artifact(&root, "kernel.elf").is_some());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn build_errors_finds_artifacts() {
+        let base = fixture("build");
+        let tools = McpTools::new(base.clone(), Arc::new(Database::new()));
+        let out = call(tools.get_build_errors(), &[]);
+        assert!(out.contains("kernel.elf ("), "{out}");
+        assert!(out.contains("bootloader.efi ("), "{out}");
+        assert!(!out.contains("kernel.elf not found"), "{out}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn modules_list_built_artifacts() {
+        let base = fixture("modules");
+        let tools = McpTools::new(base.clone(), Arc::new(Database::new()));
+        let out = call(tools.list_loaded_modules(), &[("category", "all")]);
+        assert!(out.contains("pci.nem"), "{out}");
+        assert!(out.contains("libfoo.nxl"), "{out}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn consistency_honours_targets() {
+        let base = fixture("consistency");
+        let tools = McpTools::new(base.clone(), Arc::new(Database::new()));
+
+        let artifacts = call(tools.check_consistency(), &[("targets", "artifacts")]);
+        assert!(artifacts.contains("(artifacts)"), "{artifacts}");
+        assert!(!artifacts.contains("Invariants ("), "{artifacts}");
+
+        let docs = call(tools.check_consistency(), &[("targets", "docs")]);
+        assert!(docs.contains("(docs)"), "{docs}");
+        assert!(!docs.contains("kernel.elf ("), "{docs}");
+
+        let all = call(tools.check_consistency(), &[("targets", "all")]);
+        assert!(all.contains("Invariants ("), "{all}");
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
